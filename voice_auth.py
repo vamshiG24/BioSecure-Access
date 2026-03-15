@@ -34,7 +34,7 @@ SAMPLE_RATE = 16000
 DURATION = 4
 THRESHOLD_VOICE = 0.40
 
-os.makedirs(VOICE_DB, exist_ok=True)
+# voice_db is intentionally NOT created anymore because Node.js handles storage
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 print("Loading voice model...")
@@ -62,33 +62,24 @@ def register_voice(name):
     print("Voice registered!")
 
 # ---------------- AUTHENTICATE ----------------
-def verify_voice_headless(test_file):
-    users = os.listdir(VOICE_DB)
-    if len(users) == 0:
-        print("No voice users found!")
-        return None
+def verify_voice_score(test_file, target_file):
+    if not os.path.exists(target_file):
+        print(f"Target file missing: {target_file}")
+        return -1
+    score, _ = voice_model.verify_files(test_file, target_file)
+    return score.item()
+def verify_voice_1v1(test_file, target_file):
+    if not os.path.exists(target_file):
+        print(f"Target file missing: {target_file}")
+        return False
 
-    best_user = None
-    best_score = -1
+    score, _ = voice_model.verify_files(test_file, target_file)
+    score = score.item()
+    print(f"Comparison Score: {score:.2f}")
 
-    for user in users:
-        db_file = os.path.abspath(os.path.join(VOICE_DB, user))
-        score, _ = voice_model.verify_files(test_file, db_file)
-        score = score.item()
-        print(f"{user} → Score: {score:.2f}")
-
-        if score > best_score:
-            best_score = score
-            best_user = user.replace(".wav", "")
-
-    if best_score > THRESHOLD_VOICE:
-        print("Voice matched:", best_user)
-        return best_user
+    if score > THRESHOLD_VOICE:
+        print("Voice matched")
+        return True
 
     print("Voice NOT recognized")
-    return None
-
-def authenticate_voice():
-    test_file = "test_voice.wav"
-    record_voice(test_file)
-    return verify_voice_headless(test_file)
+    return False

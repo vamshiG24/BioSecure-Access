@@ -67,6 +67,7 @@ face_db/
 voice_db/
 ml_api/uploads/
 web/server/uploads/
+login_log.json
 
 # --------------------
 

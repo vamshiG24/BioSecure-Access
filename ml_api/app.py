@@ -3,6 +3,7 @@ import pathlib
 import shutil
 import platform
 import sys
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -89,21 +90,29 @@ def register():
 
         print("Received register audio:", raw_audio_path)
 
-        # Convert to real WAV using librosa and soundfile
-        import librosa
-        import soundfile as sf
+        # Convert to real WAV using local ffmpeg
+        import imageio_ffmpeg
+        import subprocess
 
-        audio, sr = librosa.load(raw_audio_path, sr=16000)
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        # Instead of voice_db, just keep it in uploads cache
+        audio_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{username}_audio.wav")
 
-        audio_path = os.path.join(voice_auth.VOICE_DB, f"{username}.wav")
-        sf.write(audio_path, audio, sr)
+        try:
+            subprocess.run(
+                [ffmpeg_exe, "-y", "-i", raw_audio_path, "-ar", "16000", audio_path],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except subprocess.CalledProcessError as e:
+            print("FFMPEG Error:", e.stderr.decode('utf-8', errors='ignore'))
+            raise ValueError("Failed to process audio file.")
 
         print("Saved voice sample:", audio_path)
 
-        # Save face image
-        image_path = os.path.join(
-            os.path.dirname(__file__), "..", "face_db", f"{username}.jpg"
-        )
+        # Save face image to uploads cache instead of face_db
+        image_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{username}_face.jpg")
         image_file.save(image_path)
 
         print("Saved face image:", image_path)
@@ -122,37 +131,78 @@ def register():
 # -----------------------------
 @app.route("/api/verify_voice", methods=["POST"])
 def verify_voice():
+    # Node.js sends candidate as 'audio'
+    if "audio" not in request.files or "targets_meta" not in request.form:
+        return jsonify({"success": False, "message": "Missing audio or targets_meta"}), 400
 
-    if "audio" not in request.files:
-        return jsonify({"success": False, "message": "No audio file"}), 400
-
-    file = request.files["audio"]
+    candidate_file = request.files["audio"]
+    targets_meta = json.loads(request.form["targets_meta"])
+    targets_files = request.files.getlist("targets")
 
     try:
+        import imageio_ffmpeg
+        import subprocess
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-        filename = secure_filename(file.filename)
+        # 1. Convert candidate
+        candidate_filename = secure_filename("candidate_" + candidate_file.filename)
+        candidate_raw_path = os.path.join(app.config["UPLOAD_FOLDER"], candidate_filename)
+        candidate_file.save(candidate_raw_path)
+        print("Received verify candidate:", candidate_raw_path)
 
-        raw_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        file.save(raw_path)
+        candidate_wav_path = os.path.splitext(candidate_raw_path)[0] + "_converted.wav"
+        
+        try:
+            subprocess.run(
+                [ffmpeg_exe, "-y", "-i", candidate_raw_path, "-ar", "16000", candidate_wav_path],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+        except subprocess.CalledProcessError as e:
+            print("FFMPEG Error on candidate:", e.stderr.decode('utf-8', errors='ignore'))
+            raise ValueError("Failed to process candidate audio.")
 
-        print("Received verify audio:", raw_path)
+        # 2. Convert and test targets
+        best_user = None
+        best_score = -1
 
-        # Convert to WAV using librosa and soundfile
-        import librosa
-        import soundfile as sf
+        for t_file in targets_files:
+            # Find which user this file belongs to via targets_meta
+            t_user = next((u for u, f in targets_meta.items() if f == t_file.filename), None)
+            if not t_user: continue
 
-        wav_path = os.path.splitext(raw_path)[0] + "_converted.wav"
+            # Save raw target
+            t_raw_path = os.path.join(app.config["UPLOAD_FOLDER"], f"target_{t_user}_{t_file.filename}")
+            t_file.save(t_raw_path)
 
-        audio, sr = librosa.load(raw_path, sr=16000)
-        sf.write(wav_path, audio, sr)
+            t_wav_path = os.path.splitext(t_raw_path)[0] + "_converted.wav"
+            try:
+                subprocess.run(
+                    [ffmpeg_exe, "-y", "-i", t_raw_path, "-ar", "16000", t_wav_path],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+            except subprocess.CalledProcessError:
+                continue
 
-        print("Converted to wav:", wav_path)
+            # Compare
+            score = voice_auth.verify_voice_score(candidate_wav_path, t_wav_path)
+            print(f"{t_user} → Score: {score:.2f}")
 
-        # Voice recognition
-        user = voice_auth.verify_voice_headless(wav_path)
+            if score > best_score:
+                best_score = score
+                best_user = t_user
 
-        if user:
-            return jsonify({"success": True, "user": user})
+            # Cleanup target temp files
+            if os.path.exists(t_raw_path): os.remove(t_raw_path)
+            if os.path.exists(t_wav_path): os.remove(t_wav_path)
+
+        # Cleanup candidate test files
+        if os.path.exists(candidate_raw_path): os.remove(candidate_raw_path)
+        if os.path.exists(candidate_wav_path): os.remove(candidate_wav_path)
+
+        # 3. Decide match
+        if best_score > voice_auth.THRESHOLD_VOICE:
+            print("Voice matched:", best_user)
+            return jsonify({"success": True, "user": best_user})
 
         return jsonify({"success": False, "message": "Voice not recognized"})
 
@@ -175,18 +225,19 @@ def verify_face():
 
     try:
 
-        filename = secure_filename(file.filename)
-
+        filename = secure_filename(f"test_{username}_" + file.filename)
         path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         file.save(path)
 
         print("Received face image:", path)
 
-        user_image = os.path.join(
-            os.path.dirname(__file__), "..", "face_db", f"{username}.jpg"
-        )
+        # Target image is the one in the uploads cache
+        user_image = os.path.join(app.config["UPLOAD_FOLDER"], f"{username}_face.jpg")
 
         match = face_auth.verify_face_headless(path, user_image)
+
+        # Cleanup test file
+        if os.path.exists(path): os.remove(path)
 
         if match:
             return jsonify({"success": True})
@@ -195,6 +246,33 @@ def verify_face():
 
     except Exception as e:
         print("Face error:", repr(e))
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# -----------------------------
+# DELETE USER
+# -----------------------------
+@app.route("/api/delete_user", methods=["POST"])
+def delete_user():
+    username = request.form.get("username")
+    if not username:
+        return jsonify({"success": False, "message": "Missing username"}), 400
+        
+    try:
+        audio_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{username}_audio.wav")
+        image_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{username}_face.jpg")
+        
+        deleted = False
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+            deleted = True
+        if os.path.exists(image_path):
+            os.remove(image_path)
+            deleted = True
+            
+        return jsonify({"success": True, "message": f"User {username} cache cleaned"})
+    except Exception as e:
+        print("Delete error:", repr(e))
         return jsonify({"success": False, "message": str(e)}), 500
 
 
